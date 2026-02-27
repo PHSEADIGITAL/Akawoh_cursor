@@ -9,6 +9,7 @@ import {
   getOwnerPayoutSettings,
   listCreatorGroups,
   listUsers,
+  processMemberRefund,
   processDeposit,
   processPersonalWithdrawal,
   respondToInvite,
@@ -162,6 +163,11 @@ export async function POST(req: NextRequest) {
 
     if (action === "run-group-payout") {
       const result = await runGroupPayout(String(payload.groupId));
+      return NextResponse.json({ ok: true, result });
+    }
+
+    if (action === "process-refund") {
+      const result = await processMemberRefund(String(payload.memberId));
       return NextResponse.json({ ok: true, result });
     }
 

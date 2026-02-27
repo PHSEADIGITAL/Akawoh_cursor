@@ -24,11 +24,6 @@ enum ContributionFrequency {
   MONTHLY
 }
 
-enum GroupStatus {
-  ACTIVE
-  COMPLETED
-}
-
 enum TransactionType {
   DEPOSIT
   ALLOCATION
@@ -64,25 +59,27 @@ enum NotificationType {
 }
 
 model User {
-  id                   String          @id @default(uuid())
+  id                   String            @id @default(uuid())
   name                 String
-  email                String          @unique
-  phone                String          @unique
-  walletBalance        Decimal         @default(0)
+  email                String            @unique
+  phone                String            @unique
+  walletBalance        Decimal           @default(0)
+  riskScore            Int               @default(100)
   bvn                  String?
-  kycStatus            KYCStatus       @default(PENDING)
+  kycStatus            KYCStatus         @default(PENDING)
   bankCode             String?
   bankAccountNumber    String?
   bankAccountName      String?
   paystackCustomerCode String?
   virtualAccountNumber String?
-  createdAt            DateTime        @default(now())
-  updatedAt            DateTime        @updatedAt
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
   lockedSavings        LockedSavings?
-  groupMemberships     GroupMember[]
-  createdGroups        Group[]         @relation("GroupCreator")
-  sentInvites          GroupInvite[]   @relation("InviteCreator")
-  receivedInvites      GroupInvite[]   @relation("InviteRecipient")
+  memberships          GroupMember[]
+  createdGroups        SavingsGroup[]    @relation("GroupCreator")
+  sentInvites          GroupInvite[]     @relation("InviteCreator")
+  receivedInvites      GroupInvite[]     @relation("InviteRecipient")
+  ledgerEntries        Ledger[]
   transactions         Transaction[]
   allocations          Allocation[]
   notifications        Notification[]
@@ -104,60 +101,106 @@ model LockedSavings {
   allocations           Allocation[]
 }
 
-model Group {
-  id                 String        @id @default(uuid())
-  name               String
-  creatorId          String
-  creator            User          @relation("GroupCreator", fields: [creatorId], references: [id], onDelete: Cascade)
-  contributionAmount Decimal
-  cycleDuration      Int
-  minBuffer          Decimal
-  payoutCursor       Int           @default(1)
-  currentCycle       Int           @default(1)
-  poolBalance        Decimal       @default(0)
-  status             GroupStatus   @default(ACTIVE)
-  createdAt          DateTime      @default(now())
-  updatedAt          DateTime      @updatedAt
-  members            GroupMember[]
-  invites            GroupInvite[]
-  allocations        Allocation[]
-  transactions       Transaction[]
+model SavingsGroup {
+  id                String            @id @default(uuid())
+  name              String
+  creatorId         String
+  creator           User              @relation("GroupCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  monthlyAmount     Decimal
+  bufferAmount      Decimal
+  totalMonths       Int
+  currentMonth      Int               @default(1)
+  locked            Boolean           @default(false)
+  isActive          Boolean           @default(true)
+  escrowBalance     Decimal           @default(0)
+  payoutProcessing  Boolean           @default(false)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  members           GroupMember[]
+  invites           GroupInvite[]
+  ledgerEntries     Ledger[]
+  allocations       Allocation[]
+  transactions      Transaction[]
+  cronLocks         CronExecutionLock[]
   revenues           PlatformRevenue[] @relation("RevenueSourceGroup")
+
+  @@index([isActive, currentMonth])
 }
 
 model GroupMember {
-  id          String   @id @default(uuid())
-  groupId     String
-  group       Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  payoutOrder Int
-  totalPaid   Decimal  @default(0)
-  carryOver   Decimal  @default(0)
-  paidFlag    Boolean  @default(false)
-  joinedAt    DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id               String       @id @default(uuid())
+  userId           String
+  groupId          String
+  payoutOrder      Int
+  isActive         Boolean      @default(true)
+  hasDefaulted     Boolean      @default(false)
+  graceUsed        Boolean      @default(false)
+  totalContributed Decimal      @default(0)
+  bufferLocked     Decimal      @default(0)
+  joinedAt         DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group            SavingsGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
 
   @@unique([groupId, userId])
   @@unique([groupId, payoutOrder])
+  @@index([groupId, isActive, payoutOrder])
 }
 
 model GroupInvite {
-  id                  String      @id @default(uuid())
+  id                  String       @id @default(uuid())
   groupId             String
-  group               Group       @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  group               SavingsGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
   creatorId           String
-  creator             User        @relation("InviteCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  creator             User         @relation("InviteCreator", fields: [creatorId], references: [id], onDelete: Cascade)
   inviteeId           String
-  invitee             User        @relation("InviteRecipient", fields: [inviteeId], references: [id], onDelete: Cascade)
+  invitee             User         @relation("InviteRecipient", fields: [inviteeId], references: [id], onDelete: Cascade)
   phoneLookup         String
   proposedPayoutOrder Int?
   status              InviteStatus @default(PENDING)
-  createdAt           DateTime    @default(now())
+  createdAt           DateTime     @default(now())
   acknowledgedAt      DateTime?
   respondedAt         DateTime?
 
   @@index([groupId, status])
+}
+
+model Ledger {
+  id        String       @id @default(uuid())
+  userId    String
+  groupId   String?
+  type      String
+  amount    Decimal
+  meta      String?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group     SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([groupId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  action    String
+  groupId   String?
+  userId    String?
+  data      String?
+  createdAt DateTime @default(now())
+
+  @@index([groupId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model CronExecutionLock {
+  id        String       @id
+  groupId   String?
+  group     SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  type      String
+  month     Int?
+  createdAt DateTime     @default(now())
+
+  @@index([groupId, type, month])
 }
 
 model Transaction {
@@ -165,7 +208,7 @@ model Transaction {
   userId      String?
   user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
   groupId     String?
-  group       Group?          @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  group       SavingsGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
   type        TransactionType
   amount      Decimal
   referenceId String?         @unique
@@ -180,7 +223,7 @@ model Allocation {
   lockedSavingsId String?
   lockedSavings   LockedSavings? @relation(fields: [lockedSavingsId], references: [id], onDelete: SetNull)
   groupId         String?
-  group           Group?        @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  group           SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
   amount          Decimal
   timestamp       DateTime      @default(now())
 }
@@ -192,7 +235,7 @@ model PlatformRevenue {
   sourceUserId   String?
   sourceUser     User?       @relation("RevenueSourceUser", fields: [sourceUserId], references: [id], onDelete: SetNull)
   sourceGroupId  String?
-  sourceGroup    Group?      @relation("RevenueSourceGroup", fields: [sourceGroupId], references: [id], onDelete: SetNull)
+  sourceGroup    SavingsGroup? @relation("RevenueSourceGroup", fields: [sourceGroupId], references: [id], onDelete: SetNull)
   transactionId  String?
   ownerAccount   String
   settlementId   String?

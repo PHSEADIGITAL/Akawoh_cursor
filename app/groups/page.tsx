@@ -7,26 +7,34 @@ type User = {
   name: string;
   phone: string;
   walletBalance: number | string;
+  riskScore?: number | string;
 };
 
 type Group = {
   id: string;
   name: string;
-  contributionAmount: number | string;
-  cycleDuration: number;
-  minBuffer: number | string;
-  poolBalance: number | string;
-  payoutCursor: number;
+  monthlyAmount: number | string;
+  bufferAmount: number | string;
+  totalMonths: number;
+  currentMonth: number;
+  locked: boolean;
+  isActive: boolean;
+  escrowBalance: number | string;
+  payoutProcessing: boolean;
   members: Array<{
     id: string;
     payoutOrder: number;
-    carryOver: number | string;
-    paidFlag: boolean;
+    isActive: boolean;
+    hasDefaulted: boolean;
+    graceUsed: boolean;
+    totalContributed: number | string;
+    bufferLocked: number | string;
     user: {
       id: string;
       name: string;
       phone: string;
       walletBalance: number | string;
+      riskScore: number | string;
     };
   }>;
   invites: Array<{
@@ -36,6 +44,7 @@ type Group = {
     invitee: {
       name: string;
       phone: string;
+      riskScore?: number | string;
     };
   }>;
 };
@@ -211,8 +220,30 @@ export default function GroupsPage() {
         })
       });
       const body = await readJson(res);
+      if (body.result.cycleClosed) {
+        setMessage(body.result.message ?? "Cycle closed.");
+      } else {
+        setMessage(
+          `Payout complete. Gross ₦${asN(body.result.gross).toLocaleString()} | Fee ₦${asN(body.result.fee).toLocaleString()} | Net ₦${asN(body.result.net).toLocaleString()}`
+        );
+      }
+      await loadGroups(creatorId);
+    });
+  };
+
+  const refundMember = async (memberId: string) => {
+    await withFeedback(async () => {
+      const res = await fetch("/api/mvp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "process-refund",
+          memberId
+        })
+      });
+      const body = await readJson(res);
       setMessage(
-        `Payout complete. Gross ₦${asN(body.result.gross).toLocaleString()} | Fee ₦${asN(body.result.fee).toLocaleString()} | Net ₦${asN(body.result.net).toLocaleString()}`
+        `Refund processed. Amount ₦${asN(body.result.refundAmount).toLocaleString()} returned to user wallet.`
       );
       await loadGroups(creatorId);
     });
@@ -232,7 +263,7 @@ export default function GroupsPage() {
         <select value={creatorId} onChange={(e) => setCreatorId(e.target.value)}>
           {users.map((user) => (
             <option key={user.id} value={user.id}>
-              {user.name} ({user.phone})
+              {user.name} ({user.phone}) · Risk {asN(user.riskScore)}
             </option>
           ))}
         </select>
@@ -333,7 +364,7 @@ export default function GroupsPage() {
           <div style={{ marginTop: "0.8rem" }}>
             <p>
               Found: <strong>{searchResult.name}</strong> ({searchResult.phone}) | Wallet ₦
-              {asN(searchResult.walletBalance).toLocaleString()}
+              {asN(searchResult.walletBalance).toLocaleString()} | Risk {asN(searchResult.riskScore)}
             </p>
             <button
               className="btn-primary"
@@ -352,12 +383,17 @@ export default function GroupsPage() {
           <div className="card col-6">
             <h3>Group status</h3>
             <p className="muted">
-              Contribution: ₦{asN(selectedGroup.contributionAmount).toLocaleString()} | Min buffer: ₦
-              {asN(selectedGroup.minBuffer).toLocaleString()}
+              Monthly contribution: ₦{asN(selectedGroup.monthlyAmount).toLocaleString()} | Buffer base: ₦
+              {asN(selectedGroup.bufferAmount).toLocaleString()}
             </p>
             <p className="muted">
-              Pool balance: ₦{asN(selectedGroup.poolBalance).toLocaleString()} | Payout cursor:{" "}
-              {selectedGroup.payoutCursor}
+              Escrow: ₦{asN(selectedGroup.escrowBalance).toLocaleString()} | Month{" "}
+              {selectedGroup.currentMonth}/{selectedGroup.totalMonths}
+            </p>
+            <p className="muted">
+              Active: {selectedGroup.isActive ? "Yes" : "No"} | Payout lock:{" "}
+              {selectedGroup.payoutProcessing ? "Processing" : "Idle"} | Group lock:{" "}
+              {selectedGroup.locked ? "Locked" : "Open"}
             </p>
             <div className="btn-row">
               <button className="btn-secondary" type="button" disabled={loading} onClick={() => void runMonthly()}>
@@ -376,17 +412,39 @@ export default function GroupsPage() {
                 <tr>
                   <th>Order</th>
                   <th>Name</th>
-                  <th>Carry-over</th>
-                  <th>Paid?</th>
+                  <th>Contributed</th>
+                  <th>Buffer locked</th>
+                  <th>Grace</th>
+                  <th>Status</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
                 {selectedGroup.members.map((member) => (
                   <tr key={member.id}>
                     <td>{member.payoutOrder}</td>
-                    <td>{member.user.name}</td>
-                    <td>₦{asN(member.carryOver).toLocaleString()}</td>
-                    <td>{member.paidFlag ? "Yes" : "No"}</td>
+                    <td>
+                      {member.user.name}
+                      <div className="muted">Risk {asN(member.user.riskScore)}</div>
+                    </td>
+                    <td>₦{asN(member.totalContributed).toLocaleString()}</td>
+                    <td>₦{asN(member.bufferLocked).toLocaleString()}</td>
+                    <td>{member.graceUsed ? "Used" : "Unused"}</td>
+                    <td>{member.isActive ? "Active" : member.hasDefaulted ? "Defaulted" : "Inactive"}</td>
+                    <td>
+                      {member.isActive ? (
+                        <button
+                          className="btn-secondary"
+                          type="button"
+                          onClick={() => void refundMember(member.id)}
+                          disabled={loading}
+                        >
+                          Refund
+                        </button>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

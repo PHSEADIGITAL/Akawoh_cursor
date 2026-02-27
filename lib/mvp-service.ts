@@ -1,6 +1,7 @@
 import {
   InviteStatus,
   NotificationType,
+  Prisma,
   RevenueType,
   SettlementStatus,
   TransactionType
@@ -14,8 +15,16 @@ const OWNER_BANK_CODE = process.env.PLATFORM_OWNER_BANK_CODE ?? "044";
 const OWNER_ACCOUNT_NUMBER = process.env.PLATFORM_OWNER_ACCOUNT_NUMBER ?? "0001234567";
 const OWNER_BANK_NAME = process.env.PLATFORM_OWNER_BANK_NAME ?? "Owner Bank";
 
+const RISK_PENALTY_POINTS = 15;
+const HIGH_VALUE_MONTHLY_THRESHOLD = 150_000;
+const MIN_RISK_FOR_STANDARD_GROUP = 45;
+const MIN_RISK_FOR_HIGH_VALUE_GROUP = 65;
+
 const money = (value: unknown): number => toMoney(asNumber(value));
 const sanitizeAccountNumber = (value: string): string => value.replace(/\D+/g, "");
+
+const isUniqueViolation = (error: unknown): boolean =>
+  error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002";
 
 const nextPayoutOrder = async (groupId: string): Promise<number> => {
   const highest = await prisma.groupMember.findFirst({
@@ -26,59 +35,106 @@ const nextPayoutOrder = async (groupId: string): Promise<number> => {
   return (highest?.payoutOrder ?? 0) + 1;
 };
 
-export const ensureBootstrapData = async (): Promise<void> => {
-  const count = await prisma.user.count();
-  if (count > 0) {
-    await ensureOwnerPayoutSettings();
-    return;
+const cronLockId = (type: string, groupId: string, month?: number): string =>
+  `${type}:${groupId}:${month ?? "na"}`;
+
+const requiredBufferForRisk = (baseBuffer: number, riskScore: number): number => {
+  if (riskScore >= 80) return baseBuffer;
+  if (riskScore >= 60) return toMoney(baseBuffer * 1.25);
+  return toMoney(baseBuffer * 1.5);
+};
+
+const assertRiskAllowed = (riskScore: number, monthlyAmount: number): void => {
+  const minRisk = monthlyAmount >= HIGH_VALUE_MONTHLY_THRESHOLD ? MIN_RISK_FOR_HIGH_VALUE_GROUP : MIN_RISK_FOR_STANDARD_GROUP;
+  if (riskScore < minRisk) {
+    throw new Error(
+      `Risk score too low (${riskScore}). Minimum required for this group is ${minRisk}.`
+    );
   }
+};
 
-  await prisma.user.createMany({
-    data: [
-      {
-        name: "Platform Owner",
-        email: "owner@akawo.app",
-        phone: "+2348000000000",
-        walletBalance: 0,
-        kycStatus: "VERIFIED",
-        bankCode: "044",
-        bankAccountNumber: "0001234567",
-        bankAccountName: OWNER_ACCOUNT_NAME
-      },
-      {
-        name: "Amina Yusuf",
-        email: "amina@example.com",
-        phone: "+2348011111111",
-        walletBalance: 250000,
-        kycStatus: "VERIFIED",
-        bankCode: "058",
-        bankAccountNumber: "1112223334",
-        bankAccountName: "Amina Yusuf"
-      },
-      {
-        name: "Chinedu Okafor",
-        email: "chinedu@example.com",
-        phone: "+2348022222222",
-        walletBalance: 160000,
-        kycStatus: "VERIFIED",
-        bankCode: "057",
-        bankAccountNumber: "2223334445",
-        bankAccountName: "Chinedu Okafor"
-      },
-      {
-        name: "Fatima Bello",
-        email: "fatima@example.com",
-        phone: "+2348033333333",
-        walletBalance: 180000,
-        kycStatus: "PENDING",
-        bankCode: "011",
-        bankAccountNumber: "3334445556",
-        bankAccountName: "Fatima Bello"
-      }
-    ]
+const createAudit = async (payload: {
+  action: string;
+  groupId?: string | null;
+  userId?: string | null;
+  data?: string;
+}) => {
+  await prisma.auditLog.create({
+    data: {
+      action: payload.action,
+      groupId: payload.groupId ?? null,
+      userId: payload.userId ?? null,
+      data: payload.data ?? null
+    }
   });
+};
 
-  await ensureOwnerPayoutSettings();
+const penalizeUser = async (tx: Prisma.TransactionClient, userId: string) => {
+  await tx.user.update({
+    where: { id: userId },
+    data: {
+      riskScore: {
+        decrement: RISK_PENALTY_POINTS
+      }
+    }
+  });
+};
+
+const acquireCronLock = async (type: string, groupId: string, month?: number): Promise<string> => {
+  const id = cronLockId(type, groupId, month);
+  try {
+    await prisma.cronExecutionLock.create({
+      data: {
+        id,
+        type,
+        groupId,
+        month: month ?? null
+      }
+    });
+    return id;
+  } catch (error) {
+    if (isUniqueViolation(error)) {
+      throw new Error(`Idempotency protection: ${type} already executed for this cycle.`);
+    }
+    throw error;
+  }
+};
+
+const releaseCronLock = async (id: string) => {
+  await prisma.cronExecutionLock.deleteMany({
+    where: { id }
+  });
+};
+
+const lockPayout = async (groupId: string): Promise<void> => {
+  const lock = await prisma.savingsGroup.updateMany({
+    where: {
+      id: groupId,
+      isActive: true,
+      payoutProcessing: false,
+      locked: false
+    },
+    data: {
+      payoutProcessing: true,
+      locked: true
+    }
+  });
+  if (lock.count === 0) {
+    throw new Error("Payout already processing or group is inactive.");
+  }
+};
+
+const unlockPayout = async (groupId: string) => {
+  await prisma.savingsGroup.updateMany({
+    where: {
+      id: groupId,
+      payoutProcessing: true
+    },
+    data: {
+      payoutProcessing: false,
+      locked: false
+    }
+  });
 };
 
 const ensureOwnerPayoutSettings = async () => {
@@ -141,6 +197,65 @@ export const updateOwnerPayoutSettings = async (payload: {
   });
 };
 
+export const ensureBootstrapData = async (): Promise<void> => {
+  const count = await prisma.user.count();
+  if (count > 0) {
+    await ensureOwnerPayoutSettings();
+    return;
+  }
+
+  await prisma.user.createMany({
+    data: [
+      {
+        name: "Platform Owner",
+        email: "owner@akawo.app",
+        phone: "+2348000000000",
+        walletBalance: 0,
+        riskScore: 100,
+        kycStatus: "VERIFIED",
+        bankCode: "044",
+        bankAccountNumber: "0001234567",
+        bankAccountName: OWNER_ACCOUNT_NAME
+      },
+      {
+        name: "Amina Yusuf",
+        email: "amina@example.com",
+        phone: "+2348011111111",
+        walletBalance: 250000,
+        riskScore: 94,
+        kycStatus: "VERIFIED",
+        bankCode: "058",
+        bankAccountNumber: "1112223334",
+        bankAccountName: "Amina Yusuf"
+      },
+      {
+        name: "Chinedu Okafor",
+        email: "chinedu@example.com",
+        phone: "+2348022222222",
+        walletBalance: 160000,
+        riskScore: 86,
+        kycStatus: "VERIFIED",
+        bankCode: "057",
+        bankAccountNumber: "2223334445",
+        bankAccountName: "Chinedu Okafor"
+      },
+      {
+        name: "Fatima Bello",
+        email: "fatima@example.com",
+        phone: "+2348033333333",
+        walletBalance: 180000,
+        riskScore: 72,
+        kycStatus: "PENDING",
+        bankCode: "011",
+        bankAccountNumber: "3334445556",
+        bankAccountName: "Fatima Bello"
+      }
+    ]
+  });
+
+  await ensureOwnerPayoutSettings();
+};
+
 export const listUsers = async () => {
   await ensureBootstrapData();
   return prisma.user.findMany({
@@ -151,7 +266,8 @@ export const listUsers = async () => {
       email: true,
       phone: true,
       walletBalance: true,
-      kycStatus: true
+      kycStatus: true,
+      riskScore: true
     }
   });
 };
@@ -161,15 +277,15 @@ export const createUser = async (payload: {
   email: string;
   phone: string;
 }) => {
-  const user = await prisma.user.create({
+  return prisma.user.create({
     data: {
       name: payload.name,
       email: payload.email.toLowerCase(),
       phone: normalizePhone(payload.phone),
-      walletBalance: 0
+      walletBalance: 0,
+      riskScore: 100
     }
   });
-  return user;
 };
 
 export const createLockedSavingsPlan = async (payload: {
@@ -261,6 +377,14 @@ export const processDeposit = async (payload: {
       }
     });
 
+    await tx.ledger.create({
+      data: {
+        userId: payload.userId,
+        type: "DEPOSIT",
+        amount
+      }
+    });
+
     return {
       duplicate: false,
       transaction,
@@ -273,18 +397,21 @@ const outstandingObligations = async (userId: string): Promise<number> => {
   const memberships = await prisma.groupMember.findMany({
     where: {
       userId,
-      group: { status: "ACTIVE" }
+      isActive: true,
+      group: { isActive: true }
     },
     include: {
       group: true
     }
   });
 
-  return toMoney(
-    memberships.reduce((sum, member) => {
-      return sum + money(member.carryOver) + money(member.group.minBuffer);
-    }, 0)
-  );
+  const owed = memberships.reduce((sum, member) => {
+    const expectedByMonth = money(member.group.monthlyAmount) * member.group.currentMonth;
+    const shortfall = Math.max(0, expectedByMonth - money(member.totalContributed));
+    return sum + shortfall;
+  }, 0);
+
+  return toMoney(owed);
 };
 
 export const processPersonalWithdrawal = async (payload: {
@@ -375,6 +502,18 @@ export const processPersonalWithdrawal = async (payload: {
       }
     });
 
+    await tx.ledger.create({
+      data: {
+        userId: payload.userId,
+        type: "WITHDRAWAL",
+        amount: gross,
+        meta: JSON.stringify({
+          netAmount: net,
+          feeAmount: fee
+        })
+      }
+    });
+
     return {
       gross,
       net,
@@ -393,17 +532,43 @@ export const createGroup = async (payload: {
   cycleDuration: number;
   minBuffer?: number;
 }) => {
-  const contributionAmount = money(payload.contributionAmount);
-  const minBuffer = payload.minBuffer ? money(payload.minBuffer) : contributionAmount;
+  const monthlyAmount = money(payload.contributionAmount);
+  const bufferAmount = payload.minBuffer ? money(payload.minBuffer) : monthlyAmount;
+  const totalMonths = payload.cycleDuration;
+  if (monthlyAmount <= 0 || totalMonths <= 0) {
+    throw new Error("Group monthly contribution and cycle months must be positive.");
+  }
+
+  const creator = await prisma.user.findUnique({
+    where: { id: payload.creatorId }
+  });
+  if (!creator) throw new Error("Creator not found.");
+  assertRiskAllowed(creator.riskScore, monthlyAmount);
+
+  const creatorBuffer = requiredBufferForRisk(bufferAmount, creator.riskScore);
+  if (money(creator.walletBalance) < creatorBuffer) {
+    throw new Error(
+      `Creator wallet must have at least ${creatorBuffer.toLocaleString()} for locked buffer.`
+    );
+  }
 
   return prisma.$transaction(async (tx) => {
-    const group = await tx.group.create({
+    const group = await tx.savingsGroup.create({
       data: {
         creatorId: payload.creatorId,
         name: payload.name,
-        contributionAmount,
-        cycleDuration: payload.cycleDuration,
-        minBuffer
+        monthlyAmount,
+        bufferAmount,
+        totalMonths
+      }
+    });
+
+    await tx.user.update({
+      where: { id: payload.creatorId },
+      data: {
+        walletBalance: {
+          decrement: creatorBuffer
+        }
       }
     });
 
@@ -411,7 +576,33 @@ export const createGroup = async (payload: {
       data: {
         groupId: group.id,
         userId: payload.creatorId,
-        payoutOrder: 1
+        payoutOrder: 1,
+        bufferLocked: creatorBuffer
+      }
+    });
+
+    await tx.ledger.create({
+      data: {
+        userId: payload.creatorId,
+        groupId: group.id,
+        type: "BUFFER_LOCK",
+        amount: creatorBuffer,
+        meta: JSON.stringify({
+          reason: "Creator join lock"
+        })
+      }
+    });
+
+    await tx.auditLog.create({
+      data: {
+        action: "GROUP_CREATED",
+        groupId: group.id,
+        userId: payload.creatorId,
+        data: JSON.stringify({
+          monthlyAmount,
+          bufferAmount,
+          totalMonths
+        })
       }
     });
 
@@ -420,7 +611,7 @@ export const createGroup = async (payload: {
 };
 
 export const listCreatorGroups = async (creatorId: string) =>
-  prisma.group.findMany({
+  prisma.savingsGroup.findMany({
     where: { creatorId },
     include: {
       members: {
@@ -430,7 +621,8 @@ export const listCreatorGroups = async (creatorId: string) =>
               id: true,
               name: true,
               phone: true,
-              walletBalance: true
+              walletBalance: true,
+              riskScore: true
             }
           }
         },
@@ -442,12 +634,13 @@ export const listCreatorGroups = async (creatorId: string) =>
             select: {
               id: true,
               name: true,
-              phone: true
+              phone: true,
+              riskScore: true
             }
           }
         },
         orderBy: { createdAt: "desc" },
-        take: 20
+        take: 30
       }
     },
     orderBy: { createdAt: "desc" }
@@ -462,7 +655,8 @@ export const searchUserByPhone = async (phone: string) => {
       name: true,
       phone: true,
       email: true,
-      walletBalance: true
+      walletBalance: true,
+      riskScore: true
     }
   });
 };
@@ -479,7 +673,7 @@ export const sendGroupInvite = async (payload: {
   });
   if (!invitee) throw new Error("No user found with that phone number.");
 
-  const group = await prisma.group.findUnique({
+  const group = await prisma.savingsGroup.findUnique({
     where: { id: payload.groupId },
     include: {
       members: true
@@ -488,6 +682,9 @@ export const sendGroupInvite = async (payload: {
   if (!group) throw new Error("Group not found.");
   if (group.creatorId !== payload.creatorId) {
     throw new Error("Only the group creator can send invites.");
+  }
+  if (!group.isActive) {
+    throw new Error("Group is already closed.");
   }
 
   const isMember = group.members.some((member) => member.userId === invitee.id);
@@ -533,7 +730,19 @@ export const sendGroupInvite = async (payload: {
       data: {
         userId: invitee.id,
         type: NotificationType.GROUP_INVITE,
-        message: `New group invite from creator. Open app to accept and join group ${group.name}.`
+        message: `Group invite received for ${group.name}. Acknowledge in-app to complete join.`
+      }
+    });
+
+    await tx.auditLog.create({
+      data: {
+        action: "GROUP_INVITE_SENT",
+        groupId: payload.groupId,
+        userId: payload.creatorId,
+        data: JSON.stringify({
+          inviteeId: invitee.id,
+          payoutOrder
+        })
       }
     });
 
@@ -552,8 +761,10 @@ export const listInvitesForUser = async (userId: string) =>
         select: {
           id: true,
           name: true,
-          contributionAmount: true,
-          minBuffer: true
+          monthlyAmount: true,
+          bufferAmount: true,
+          currentMonth: true,
+          totalMonths: true
         }
       },
       creator: {
@@ -591,9 +802,12 @@ export const respondToInvite = async (payload: {
   if (invite.status !== InviteStatus.PENDING) {
     throw new Error("Invite has already been processed.");
   }
+  if (!invite.group.isActive) {
+    throw new Error("This group is no longer active.");
+  }
 
   if (payload.action === "DECLINE") {
-    return prisma.groupInvite.update({
+    const declined = await prisma.groupInvite.update({
       where: { id: payload.inviteId },
       data: {
         status: InviteStatus.DECLINED,
@@ -601,24 +815,58 @@ export const respondToInvite = async (payload: {
         respondedAt: new Date()
       }
     });
+
+    await createAudit({
+      action: "GROUP_INVITE_DECLINED",
+      groupId: invite.groupId,
+      userId: payload.inviteeId
+    });
+    return declined;
   }
 
-  const requiredBuffer = Math.max(money(invite.group.minBuffer), money(invite.group.contributionAmount));
+  const monthlyAmount = money(invite.group.monthlyAmount);
+  assertRiskAllowed(invite.invitee.riskScore, monthlyAmount);
+  const requiredBuffer = requiredBufferForRisk(
+    money(invite.group.bufferAmount),
+    invite.invitee.riskScore
+  );
   const wallet = money(invite.invitee.walletBalance);
   if (wallet < requiredBuffer) {
     throw new Error(
-      `Invite acknowledged, but buffer check failed. Wallet must be at least ${requiredBuffer.toLocaleString()}.`
+      `Join blocked: buffer requirement is ${requiredBuffer.toLocaleString()} for current risk score.`
     );
   }
 
   const finalPayoutOrder = invite.proposedPayoutOrder ?? (await nextPayoutOrder(invite.groupId));
 
   return prisma.$transaction(async (tx) => {
+    await tx.user.update({
+      where: { id: payload.inviteeId },
+      data: {
+        walletBalance: {
+          decrement: requiredBuffer
+        }
+      }
+    });
+
     await tx.groupMember.create({
       data: {
         groupId: invite.groupId,
         userId: payload.inviteeId,
-        payoutOrder: finalPayoutOrder
+        payoutOrder: finalPayoutOrder,
+        bufferLocked: requiredBuffer
+      }
+    });
+
+    await tx.ledger.create({
+      data: {
+        userId: payload.inviteeId,
+        groupId: invite.groupId,
+        type: "BUFFER_LOCK",
+        amount: requiredBuffer,
+        meta: JSON.stringify({
+          riskScore: invite.invitee.riskScore
+        })
       }
     });
 
@@ -631,235 +879,566 @@ export const respondToInvite = async (payload: {
       }
     });
 
+    await tx.auditLog.create({
+      data: {
+        action: "GROUP_MEMBER_JOINED",
+        groupId: invite.groupId,
+        userId: payload.inviteeId,
+        data: JSON.stringify({
+          payoutOrder: finalPayoutOrder,
+          requiredBuffer
+        })
+      }
+    });
+
     return updated;
   });
 };
 
 export const runMonthlyAllocation = async (groupId: string) => {
-  const group = await prisma.group.findUnique({
-    where: { id: groupId },
-    include: {
-      members: true
-    }
-  });
-  if (!group) throw new Error("Group not found.");
-  if (group.status !== "ACTIVE") throw new Error("Group is not active.");
-
-  const contribution = money(group.contributionAmount);
-
-  return prisma.$transaction(async (tx) => {
-    const freshMembers = await tx.groupMember.findMany({
-      where: { groupId },
-      include: { user: true },
-      orderBy: { payoutOrder: "asc" }
-    });
-
-    let cycleCollection = 0;
-
-    for (const member of freshMembers) {
-      const wallet = money(member.user.walletBalance);
-      const obligation = toMoney(contribution + money(member.carryOver));
-      const deduction = Math.min(wallet, obligation);
-      const newCarryOver = toMoney(obligation - deduction);
-      cycleCollection += deduction;
-
-      await tx.user.update({
-        where: { id: member.userId },
-        data: {
-          walletBalance: {
-            decrement: deduction
-          }
-        }
-      });
-
-      await tx.groupMember.update({
-        where: { id: member.id },
-        data: {
-          totalPaid: {
-            increment: deduction
-          },
-          carryOver: newCarryOver
-        }
-      });
-
-      await tx.allocation.create({
-        data: {
-          userId: member.userId,
-          groupId,
-          amount: deduction
-        }
-      });
-
-      await tx.transaction.create({
-        data: {
-          userId: member.userId,
-          groupId,
-          type: TransactionType.ALLOCATION,
-          amount: deduction,
-          metadata: {
-            obligation,
-            carryOverAfter: newCarryOver,
-            cycle: group.currentCycle
-          }
-        }
-      });
-
-      if (newCarryOver > 0) {
-        await tx.notification.create({
-          data: {
-            userId: member.userId,
-            type: NotificationType.CARRY_OVER_ALERT,
-            message: `You still owe ${newCarryOver.toLocaleString()} in group ${group.name}.`
-          }
-        });
-      }
-    }
-
-    const updatedGroup = await tx.group.update({
-      where: { id: groupId },
-      data: {
-        poolBalance: {
-          increment: cycleCollection
-        },
-        currentCycle: {
-          increment: 1
-        }
-      }
-    });
-
-    return {
-      collected: toMoney(cycleCollection),
-      poolBalance: money(updatedGroup.poolBalance)
-    };
-  });
-};
-
-export const runGroupPayout = async (groupId: string) => {
-  const ownerSettings = await ensureOwnerPayoutSettings();
-  const ownerAccountLabel = ownerSettings.ownerName;
-  const group = await prisma.group.findUnique({
+  const snapshot = await prisma.savingsGroup.findUnique({
     where: { id: groupId },
     include: {
       members: {
         include: {
           user: true
-        },
-        orderBy: { payoutOrder: "asc" }
+        }
       }
     }
   });
-  if (!group) throw new Error("Group not found.");
 
-  const outstanding = group.members.reduce((sum, member) => sum + money(member.carryOver), 0);
-  if (outstanding > 0) {
-    throw new Error("Payout blocked: outstanding obligations and carry-over remain.");
+  if (!snapshot) throw new Error("Group not found.");
+  if (!snapshot.isActive) throw new Error("Group is inactive.");
+  if (snapshot.currentMonth > snapshot.totalMonths) {
+    throw new Error("Group cycle is complete.");
   }
 
-  const gross = money(group.poolBalance);
-  if (gross <= 0) {
-    throw new Error("No pooled balance available for payout.");
+  const lockId = await acquireCronLock("MONTHLY_ALLOCATION", groupId, snapshot.currentMonth);
+
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const group = await tx.savingsGroup.findUnique({
+        where: { id: groupId },
+        include: {
+          members: {
+            include: {
+              user: true
+            }
+          }
+        }
+      });
+
+      if (!group || !group.isActive) {
+        throw new Error("Group not active.");
+      }
+
+      const activeMembers = group.members.filter((member) => member.isActive);
+      if (activeMembers.length === 0) {
+        throw new Error("No active members to allocate.");
+      }
+
+      const monthlyAmount = money(group.monthlyAmount);
+      let escrowAdded = 0;
+
+      for (const member of activeMembers) {
+        const available = money(member.user.walletBalance);
+        const deduction = Math.min(available, monthlyAmount);
+
+        if (deduction > 0) {
+          await tx.user.update({
+            where: { id: member.userId },
+            data: {
+              walletBalance: {
+                decrement: deduction
+              }
+            }
+          });
+
+          await tx.groupMember.update({
+            where: { id: member.id },
+            data: {
+              totalContributed: {
+                increment: deduction
+              }
+            }
+          });
+
+          await tx.ledger.create({
+            data: {
+              userId: member.userId,
+              groupId,
+              type: "CONTRIBUTION",
+              amount: deduction,
+              meta: JSON.stringify({ month: group.currentMonth })
+            }
+          });
+
+          await tx.transaction.create({
+            data: {
+              userId: member.userId,
+              groupId,
+              type: TransactionType.ALLOCATION,
+              amount: deduction,
+              metadata: {
+                month: group.currentMonth
+              }
+            }
+          });
+
+          escrowAdded = toMoney(escrowAdded + deduction);
+        }
+
+        if (deduction < monthlyAmount) {
+          await tx.notification.create({
+            data: {
+              userId: member.userId,
+              type: NotificationType.MISSED_CONTRIBUTION,
+              message: `Monthly contribution shortfall: paid ${deduction.toLocaleString()} out of ${monthlyAmount.toLocaleString()} in ${group.name}.`
+            }
+          });
+        }
+      }
+
+      const updatedGroup = await tx.savingsGroup.update({
+        where: { id: groupId },
+        data: {
+          escrowBalance: {
+            increment: escrowAdded
+          }
+        }
+      });
+
+      await tx.auditLog.create({
+        data: {
+          action: "MONTHLY_ALLOCATION",
+          groupId,
+          data: JSON.stringify({
+            month: group.currentMonth,
+            escrowAdded
+          })
+        }
+      });
+
+      return {
+        groupId,
+        month: group.currentMonth,
+        collected: escrowAdded,
+        escrowBalance: money(updatedGroup.escrowBalance)
+      };
+    });
+  } catch (error) {
+    await releaseCronLock(lockId);
+    throw error;
   }
+};
 
-  const receiver =
-    group.members.find((member) => member.payoutOrder === group.payoutCursor) ?? group.members[0];
-  if (!receiver) {
-    throw new Error("No members available for payout.");
+export const runGroupPayout = async (groupId: string) => {
+  const ownerSettings = await ensureOwnerPayoutSettings();
+  const ownerAccountLabel = ownerSettings.ownerName;
+
+  await lockPayout(groupId);
+  let payoutLockAcquired = true;
+  let cronLock: string | null = null;
+
+  try {
+    const startGroup = await prisma.savingsGroup.findUnique({
+      where: { id: groupId }
+    });
+    if (!startGroup) throw new Error("Group not found.");
+    if (!startGroup.isActive) throw new Error("Group is inactive.");
+    if (startGroup.currentMonth > startGroup.totalMonths) {
+      await prisma.savingsGroup.update({
+        where: { id: groupId },
+        data: {
+          isActive: false,
+          payoutProcessing: false,
+          locked: false
+        }
+      });
+      payoutLockAcquired = false;
+      return {
+        groupId,
+        cycleClosed: true,
+        message: "Group cycle already completed."
+      };
+    }
+
+    cronLock = await acquireCronLock("MONTHLY_PAYOUT", groupId, startGroup.currentMonth);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const group = await tx.savingsGroup.findUnique({
+        where: { id: groupId },
+        include: {
+          members: {
+            include: {
+              user: true
+            },
+            orderBy: { payoutOrder: "asc" }
+          }
+        }
+      });
+      if (!group) throw new Error("Group not found.");
+      if (!group.isActive) throw new Error("Group is inactive.");
+
+      const activeMembers = group.members.filter((member) => member.isActive);
+      if (activeMembers.length === 0) {
+        await tx.savingsGroup.update({
+          where: { id: groupId },
+          data: {
+            isActive: false,
+            payoutProcessing: false,
+            locked: false
+          }
+        });
+
+        await tx.auditLog.create({
+          data: {
+            action: "CYCLE_COMPLETED",
+            groupId,
+            data: JSON.stringify({ reason: "No active members available for payout." })
+          }
+        });
+
+        payoutLockAcquired = false;
+        return {
+          groupId,
+          cycleClosed: true,
+          message: "No active members available. Cycle closed."
+        };
+      }
+
+      const monthlyAmount = money(group.monthlyAmount);
+      let escrow = money(group.escrowBalance);
+
+      for (const member of activeMembers) {
+        const expectedContribution = toMoney(monthlyAmount * group.currentMonth);
+        const contributed = money(member.totalContributed);
+
+        if (contributed >= expectedContribution) {
+          continue;
+        }
+
+        if (!member.graceUsed) {
+          await tx.groupMember.update({
+            where: { id: member.id },
+            data: {
+              graceUsed: true
+            }
+          });
+
+          await tx.auditLog.create({
+            data: {
+              action: "GRACE_GRANTED",
+              groupId,
+              userId: member.userId,
+              data: JSON.stringify({
+                month: group.currentMonth,
+                expectedContribution,
+                contributed
+              })
+            }
+          });
+          continue;
+        }
+
+        if (money(member.bufferLocked) >= monthlyAmount) {
+          await tx.groupMember.update({
+            where: { id: member.id },
+            data: {
+              bufferLocked: {
+                decrement: monthlyAmount
+              },
+              isActive: false,
+              hasDefaulted: true
+            }
+          });
+
+          await penalizeUser(tx, member.userId);
+
+          escrow = toMoney(escrow + monthlyAmount);
+
+          await tx.ledger.create({
+            data: {
+              userId: member.userId,
+              groupId,
+              type: "PENALTY",
+              amount: monthlyAmount,
+              meta: JSON.stringify({
+                month: group.currentMonth,
+                reason: "Default after grace"
+              })
+            }
+          });
+
+          await tx.auditLog.create({
+            data: {
+              action: "MEMBER_DEFAULTED",
+              groupId,
+              userId: member.userId,
+              data: JSON.stringify({
+                month: group.currentMonth,
+                penaltyAmount: monthlyAmount
+              })
+            }
+          });
+          continue;
+        }
+
+        await tx.auditLog.create({
+          data: {
+            action: "CRITICAL_BUFFER_FAILURE",
+            groupId,
+            userId: member.userId,
+            data: JSON.stringify({
+              month: group.currentMonth,
+              required: monthlyAmount,
+              availableBuffer: money(member.bufferLocked)
+            })
+          }
+        });
+        throw new Error("Critical buffer failure.");
+      }
+
+      const refreshedActive = await tx.groupMember.findMany({
+        where: { groupId, isActive: true },
+        orderBy: { payoutOrder: "asc" }
+      });
+      if (refreshedActive.length === 0) {
+        throw new Error("No eligible members remain for payout.");
+      }
+
+      const receiver = refreshedActive.find((member) => member.payoutOrder === group.currentMonth) ?? refreshedActive[0];
+      const gross = money(escrow);
+      if (gross <= 0) {
+        throw new Error("No escrow balance available for payout.");
+      }
+
+      const fee = calculatePlatformFee(gross);
+      const net = toMoney(gross - fee);
+      if (net <= 0) {
+        throw new Error("Payout net amount is not positive after fee.");
+      }
+
+      const nextMonth = group.currentMonth + 1;
+      const cycleCompleted = nextMonth > group.totalMonths;
+
+      await tx.user.update({
+        where: { id: receiver.userId },
+        data: {
+          walletBalance: {
+            increment: net
+          }
+        }
+      });
+
+      const payoutTx = await tx.transaction.create({
+        data: {
+          userId: receiver.userId,
+          groupId,
+          type: TransactionType.PAYOUT,
+          amount: net,
+          referenceId: `payout_${groupId}_${group.currentMonth}_${Date.now()}`,
+          metadata: {
+            gross,
+            fee,
+            month: group.currentMonth
+          }
+        }
+      });
+
+      await tx.ledger.create({
+        data: {
+          userId: receiver.userId,
+          groupId,
+          type: "PAYOUT",
+          amount: net,
+          meta: JSON.stringify({
+            gross,
+            fee,
+            month: group.currentMonth
+          })
+        }
+      });
+
+      await tx.transaction.create({
+        data: {
+          groupId,
+          type: TransactionType.CIRCLE_PAYOUT_FEE,
+          amount: fee,
+          metadata: {
+            ownerAccount: ownerAccountLabel,
+            linkedTo: payoutTx.id
+          }
+        }
+      });
+
+      await tx.platformRevenue.create({
+        data: {
+          type: RevenueType.CIRCLE_PAYOUT_FEE,
+          amount: fee,
+          sourceGroupId: groupId,
+          sourceUserId: receiver.userId,
+          transactionId: payoutTx.id,
+          ownerAccount: ownerAccountLabel
+        }
+      });
+
+      await tx.groupMember.updateMany({
+        where: { groupId, isActive: true },
+        data: {
+          graceUsed: false
+        }
+      });
+
+      await tx.savingsGroup.update({
+        where: { id: groupId },
+        data: {
+          escrowBalance: 0,
+          currentMonth: nextMonth,
+          payoutProcessing: false,
+          locked: false,
+          isActive: !cycleCompleted
+        }
+      });
+
+      await tx.auditLog.create({
+        data: {
+          action: "MONTHLY_PAYOUT",
+          groupId,
+          userId: receiver.userId,
+          data: JSON.stringify({
+            month: group.currentMonth,
+            gross,
+            net,
+            fee,
+            cycleCompleted
+          })
+        }
+      });
+
+      if (cycleCompleted) {
+        await tx.auditLog.create({
+          data: {
+            action: "CYCLE_COMPLETED",
+            groupId,
+            data: JSON.stringify({
+              totalMonths: group.totalMonths
+            })
+          }
+        });
+      }
+
+      await tx.notification.createMany({
+        data: group.members.map((member) => ({
+          userId: member.userId,
+          type: NotificationType.PAYOUT_COMPLETED,
+          message:
+            member.userId === receiver.userId
+              ? `You received payout of ${net.toLocaleString()} from ${group.name}.`
+              : `Payout completed for month ${group.currentMonth} in ${group.name}.`
+        }))
+      });
+
+      payoutLockAcquired = false;
+      return {
+        groupId,
+        receiverUserId: receiver.userId,
+        month: group.currentMonth,
+        gross,
+        net,
+        fee,
+        ownerAccount: ownerAccountLabel,
+        cycleCompleted
+      };
+    });
+
+    return result;
+  } catch (error) {
+    if (cronLock) {
+      await releaseCronLock(cronLock);
+    }
+    if (payoutLockAcquired) {
+      await unlockPayout(groupId);
+    }
+    throw error;
   }
+};
 
-  const fee = calculatePlatformFee(gross);
-  const net = toMoney(gross - fee);
-  if (net <= 0) throw new Error("Payout net amount is not positive.");
-
-  const transfer = await transferWithPaystack({
-    amount: net,
-    reason: `Group payout (${group.name})`,
-    recipient: {
-      name: receiver.user.bankAccountName ?? receiver.user.name,
-      accountNumber: receiver.user.bankAccountNumber ?? "0000000000",
-      bankCode: receiver.user.bankCode ?? "000"
+export const processMemberRefund = async (memberId: string) => {
+  const member = await prisma.groupMember.findUnique({
+    where: { id: memberId },
+    include: {
+      group: true
     }
   });
+  if (!member) throw new Error("Member not found.");
+  if (!member.isActive) throw new Error("Member is already inactive.");
+
+  const refundAmount = money(member.totalContributed);
+  if (refundAmount <= 0) {
+    throw new Error("No refundable contribution found for this member.");
+  }
+
+  const groupEscrow = money(member.group.escrowBalance);
+  if (groupEscrow < refundAmount) {
+    throw new Error("Escrow balance is insufficient to process refund.");
+  }
 
   return prisma.$transaction(async (tx) => {
-    const membersCount = group.members.length;
-    const nextCursor = group.payoutCursor >= membersCount ? 1 : group.payoutCursor + 1;
+    await tx.savingsGroup.update({
+      where: { id: member.groupId },
+      data: {
+        escrowBalance: {
+          decrement: refundAmount
+        }
+      }
+    });
 
-    await tx.groupMember.updateMany({
-      where: { groupId: group.id },
-      data: { paidFlag: false }
+    await tx.user.update({
+      where: { id: member.userId },
+      data: {
+        walletBalance: {
+          increment: refundAmount
+        }
+      }
     });
 
     await tx.groupMember.update({
-      where: { id: receiver.id },
-      data: { paidFlag: true }
-    });
-
-    await tx.group.update({
-      where: { id: group.id },
+      where: { id: member.id },
       data: {
-        poolBalance: 0,
-        payoutCursor: nextCursor
+        isActive: false
       }
     });
 
-    const payoutTx = await tx.transaction.create({
+    await tx.ledger.create({
       data: {
-        userId: receiver.userId,
-        groupId: group.id,
-        type: TransactionType.PAYOUT,
-        amount: net,
-        referenceId: transfer.reference,
-        metadata: {
-          gross,
-          fee,
-          ownerAccount: ownerAccountLabel,
-          payoutOrder: receiver.payoutOrder
-        }
-      }
-    });
-
-    await tx.transaction.create({
-      data: {
-        groupId: group.id,
-        type: TransactionType.CIRCLE_PAYOUT_FEE,
-        amount: fee,
-        metadata: {
-          linkedTo: payoutTx.id,
-          ownerAccount: ownerAccountLabel
-        }
-      }
-    });
-
-    await tx.platformRevenue.create({
-      data: {
-        type: RevenueType.CIRCLE_PAYOUT_FEE,
-        amount: fee,
-        sourceGroupId: group.id,
-        sourceUserId: receiver.userId,
-        transactionId: payoutTx.id,
-        ownerAccount: ownerAccountLabel
-      }
-    });
-
-    await tx.notification.createMany({
-      data: group.members.map((member) => ({
         userId: member.userId,
-        type: NotificationType.PAYOUT_COMPLETED,
-        message:
-          member.userId === receiver.userId
-            ? `You received group payout of ${net.toLocaleString()} in ${group.name}.`
-            : `Group payout completed in ${group.name}.`
-      }))
+        groupId: member.groupId,
+        type: "REFUND",
+        amount: refundAmount,
+        meta: JSON.stringify({
+          reason: "Early removal"
+        })
+      }
+    });
+
+    await tx.auditLog.create({
+      data: {
+        action: "MEMBER_REFUND",
+        groupId: member.groupId,
+        userId: member.userId,
+        data: JSON.stringify({
+          memberId: member.id,
+          refundAmount
+        })
+      }
     });
 
     return {
-      groupId,
-      receiverUserId: receiver.userId,
-      gross,
-      net,
-      fee,
-      ownerAccount: ownerAccountLabel,
-      transferReference: transfer.reference
+      memberId,
+      userId: member.userId,
+      groupId: member.groupId,
+      refundAmount
     };
   });
 };
@@ -894,20 +1473,31 @@ export const markMissedContribution = async () => {
 };
 
 export const processMonthlyJobs = async () => {
-  const groups = await prisma.group.findMany({ where: { status: "ACTIVE" } });
+  const groups = await prisma.savingsGroup.findMany({
+    where: { isActive: true }
+  });
   const outputs = [];
   for (const group of groups) {
-    const allocation = await runMonthlyAllocation(group.id);
-    outputs.push({
-      groupId: group.id,
-      ...allocation
-    });
+    try {
+      const allocation = await runMonthlyAllocation(group.id);
+      outputs.push({
+        groupId: group.id,
+        ok: true,
+        ...allocation
+      });
+    } catch (error) {
+      outputs.push({
+        groupId: group.id,
+        ok: false,
+        reason: error instanceof Error ? error.message : "Allocation failed"
+      });
+    }
   }
   return outputs;
 };
 
 export const processPayoutJobs = async () => {
-  const groups = await prisma.group.findMany({ where: { status: "ACTIVE" } });
+  const groups = await prisma.savingsGroup.findMany({ where: { isActive: true } });
   const outputs = [];
   for (const group of groups) {
     try {
@@ -1001,6 +1591,17 @@ export const settleOwnerRevenue = async (payload?: { initiatedBy?: string; note?
         }
       });
 
+      await tx.auditLog.create({
+        data: {
+          action: "OWNER_REVENUE_SETTLED",
+          data: JSON.stringify({
+            settlementId: settlement.id,
+            amount: grossAmount,
+            revenueCount: unsettledRevenues.length
+          })
+        }
+      });
+
       return {
         settled: true,
         message: "Owner revenue settlement completed.",
@@ -1047,7 +1648,7 @@ export const getDashboard = async (userId: string) => {
     where: { id: userId },
     include: {
       lockedSavings: true,
-      groupMemberships: {
+      memberships: {
         include: {
           group: true
         },
@@ -1055,14 +1656,19 @@ export const getDashboard = async (userId: string) => {
       },
       notifications: {
         orderBy: { createdAt: "desc" },
-        take: 10
+        take: 12
       }
     }
   });
   if (!user) throw new Error("User not found.");
 
   const invites = await listInvitesForUser(userId);
-  const obligations = user.groupMemberships.reduce((sum, member) => sum + money(member.carryOver), 0);
+  const obligations = user.memberships.reduce((sum, member) => {
+    if (!member.isActive || !member.group.isActive) return sum;
+    const expectedByMonth = money(member.group.monthlyAmount) * member.group.currentMonth;
+    const shortfall = Math.max(0, expectedByMonth - money(member.totalContributed));
+    return sum + shortfall;
+  }, 0);
 
   const transactions = await prisma.transaction.findMany({
     where: {

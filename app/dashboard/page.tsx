@@ -9,6 +9,7 @@ type User = {
   phone: string;
   walletBalance: number | string;
   kycStatus: string;
+  riskScore?: number | string;
 };
 
 type DashboardPayload = {
@@ -37,8 +38,10 @@ type DashboardPayload = {
     group: {
       id: string;
       name: string;
-      contributionAmount: number | string;
-      minBuffer: number | string;
+      monthlyAmount: number | string;
+      bufferAmount: number | string;
+      currentMonth?: number;
+      totalMonths?: number;
     };
     creator: {
       name: string;
@@ -262,7 +265,8 @@ export default function DashboardPage() {
         </select>
         {selectedUser && (
           <p className="muted" style={{ marginTop: "0.75rem" }}>
-            Wallet: ₦{asN(selectedUser.walletBalance).toLocaleString()} | KYC: {selectedUser.kycStatus}
+            Wallet: ₦{asN(selectedUser.walletBalance).toLocaleString()} | KYC: {selectedUser.kycStatus} |
+            Risk: {asN(selectedUser.riskScore)}
           </p>
         )}
       </div>
@@ -424,9 +428,9 @@ export default function DashboardPage() {
                 <strong>{invite.group.name}</strong> by {invite.creator.name} ({invite.creator.phone})
               </p>
               <p className="muted" style={{ marginTop: "0.35rem" }}>
-                Contribution: ₦{asN(invite.group.contributionAmount).toLocaleString()} | Buffer: ₦
-                {asN(invite.group.minBuffer).toLocaleString()} | Payout order:{" "}
-                {invite.proposedPayoutOrder ?? "Auto"}
+                Monthly: ₦{asN(invite.group.monthlyAmount).toLocaleString()} | Buffer: ₦
+                {asN(invite.group.bufferAmount).toLocaleString()} | Cycle: {invite.group.currentMonth ?? 1}/
+                {invite.group.totalMonths ?? "-"} | Payout order: {invite.proposedPayoutOrder ?? "Auto"}
               </p>
               <div className="btn-row">
                 <button
