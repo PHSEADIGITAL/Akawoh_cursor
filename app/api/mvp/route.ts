@@ -6,15 +6,18 @@ import {
   ensureBootstrapData,
   getAdminRevenue,
   getDashboard,
+  getOwnerPayoutSettings,
   listCreatorGroups,
   listUsers,
   processDeposit,
   processPersonalWithdrawal,
   respondToInvite,
+  settleOwnerRevenue,
   runGroupPayout,
   runMonthlyAllocation,
   searchUserByPhone,
-  sendGroupInvite
+  sendGroupInvite,
+  updateOwnerPayoutSettings
 } from "@/lib/mvp-service";
 import { normalizePhone } from "@/lib/utils";
 
@@ -63,6 +66,11 @@ export async function GET(req: NextRequest) {
     if (action === "admin-revenue") {
       const revenue = await getAdminRevenue();
       return NextResponse.json({ ok: true, revenue });
+    }
+
+    if (action === "owner-settings") {
+      const settings = await getOwnerPayoutSettings();
+      return NextResponse.json({ ok: true, settings });
     }
 
     return badRequest("Unsupported GET action.");
@@ -154,6 +162,24 @@ export async function POST(req: NextRequest) {
 
     if (action === "run-group-payout") {
       const result = await runGroupPayout(String(payload.groupId));
+      return NextResponse.json({ ok: true, result });
+    }
+
+    if (action === "update-owner-settings") {
+      const settings = await updateOwnerPayoutSettings({
+        ownerName: String(payload.ownerName ?? ""),
+        bankCode: String(payload.bankCode ?? ""),
+        accountNumber: String(payload.accountNumber ?? ""),
+        bankName: payload.bankName !== undefined ? String(payload.bankName) : undefined
+      });
+      return NextResponse.json({ ok: true, settings });
+    }
+
+    if (action === "settle-owner-revenue") {
+      const result = await settleOwnerRevenue({
+        initiatedBy: payload.initiatedBy !== undefined ? String(payload.initiatedBy) : "admin",
+        note: payload.note !== undefined ? String(payload.note) : "Manual settlement"
+      });
       return NextResponse.json({ ok: true, result });
     }
 

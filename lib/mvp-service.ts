@@ -1,11 +1,21 @@
-import { InviteStatus, NotificationType, RevenueType, TransactionType } from "@prisma/client";
+import {
+  InviteStatus,
+  NotificationType,
+  RevenueType,
+  SettlementStatus,
+  TransactionType
+} from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { asNumber, calculatePlatformFee, normalizePhone, toMoney } from "@/lib/utils";
-import { transferWithPaystack } from "@/lib/paystack";
+import { createTransferRecipient, resolveBankAccount, transferWithPaystack } from "@/lib/paystack";
 
 const OWNER_ACCOUNT_NAME = process.env.PLATFORM_OWNER_ACCOUNT_NAME ?? "Akawo Owner";
+const OWNER_BANK_CODE = process.env.PLATFORM_OWNER_BANK_CODE ?? "044";
+const OWNER_ACCOUNT_NUMBER = process.env.PLATFORM_OWNER_ACCOUNT_NUMBER ?? "0001234567";
+const OWNER_BANK_NAME = process.env.PLATFORM_OWNER_BANK_NAME ?? "Owner Bank";
 
 const money = (value: unknown): number => toMoney(asNumber(value));
+const sanitizeAccountNumber = (value: string): string => value.replace(/\D+/g, "");
 
 const nextPayoutOrder = async (groupId: string): Promise<number> => {
   const highest = await prisma.groupMember.findFirst({
@@ -18,7 +28,10 @@ const nextPayoutOrder = async (groupId: string): Promise<number> => {
 
 export const ensureBootstrapData = async (): Promise<void> => {
   const count = await prisma.user.count();
-  if (count > 0) return;
+  if (count > 0) {
+    await ensureOwnerPayoutSettings();
+    return;
+  }
 
   await prisma.user.createMany({
     data: [
@@ -63,6 +76,68 @@ export const ensureBootstrapData = async (): Promise<void> => {
         bankAccountName: "Fatima Bello"
       }
     ]
+  });
+
+  await ensureOwnerPayoutSettings();
+};
+
+const ensureOwnerPayoutSettings = async () => {
+  const existing = await prisma.ownerPayoutSetting.findFirst({
+    orderBy: { createdAt: "asc" }
+  });
+  if (existing) return existing;
+
+  return prisma.ownerPayoutSetting.create({
+    data: {
+      ownerName: OWNER_ACCOUNT_NAME,
+      bankCode: OWNER_BANK_CODE,
+      bankName: OWNER_BANK_NAME,
+      accountNumber: OWNER_ACCOUNT_NUMBER,
+      accountName: OWNER_ACCOUNT_NAME,
+      active: true
+    }
+  });
+};
+
+export const getOwnerPayoutSettings = async () => ensureOwnerPayoutSettings();
+
+export const updateOwnerPayoutSettings = async (payload: {
+  ownerName: string;
+  bankCode: string;
+  accountNumber: string;
+  bankName?: string;
+}) => {
+  const accountNumber = sanitizeAccountNumber(payload.accountNumber);
+  if (!payload.ownerName.trim()) {
+    throw new Error("Owner name is required.");
+  }
+  if (!payload.bankCode.trim()) {
+    throw new Error("Bank code is required.");
+  }
+  if (accountNumber.length < 10) {
+    throw new Error("Account number must be valid.");
+  }
+
+  const resolved = await resolveBankAccount(payload.bankCode, accountNumber);
+  const recipient = await createTransferRecipient({
+    name: payload.ownerName.trim(),
+    accountNumber,
+    bankCode: payload.bankCode
+  });
+
+  const existing = await ensureOwnerPayoutSettings();
+  return prisma.ownerPayoutSetting.update({
+    where: { id: existing.id },
+    data: {
+      ownerName: payload.ownerName.trim(),
+      bankCode: payload.bankCode,
+      bankName: payload.bankName?.trim() ? payload.bankName.trim() : null,
+      accountNumber,
+      accountName: resolved.accountName,
+      recipientCode: recipient.recipientCode,
+      active: true,
+      verifiedAt: new Date()
+    }
   });
 };
 
@@ -218,6 +293,8 @@ export const processPersonalWithdrawal = async (payload: {
 }) => {
   const requested = money(payload.amount);
   if (requested <= 0) throw new Error("Withdrawal amount must be greater than 0.");
+  const ownerSettings = await ensureOwnerPayoutSettings();
+  const ownerAccountLabel = ownerSettings.ownerName;
 
   const user = await prisma.user.findUnique({
     where: { id: payload.userId },
@@ -271,7 +348,7 @@ export const processPersonalWithdrawal = async (payload: {
           netAmount: net,
           feeAmount: fee,
           obligations,
-          ownerAccount: OWNER_ACCOUNT_NAME
+          ownerAccount: ownerAccountLabel
         }
       }
     });
@@ -283,7 +360,7 @@ export const processPersonalWithdrawal = async (payload: {
         amount: fee,
         metadata: {
           linkedTo: withdrawalTx.id,
-          ownerAccount: OWNER_ACCOUNT_NAME
+          ownerAccount: ownerAccountLabel
         }
       }
     });
@@ -294,7 +371,7 @@ export const processPersonalWithdrawal = async (payload: {
         amount: fee,
         sourceUserId: payload.userId,
         transactionId: withdrawalTx.id,
-        ownerAccount: OWNER_ACCOUNT_NAME
+        ownerAccount: ownerAccountLabel
       }
     });
 
@@ -658,6 +735,8 @@ export const runMonthlyAllocation = async (groupId: string) => {
 };
 
 export const runGroupPayout = async (groupId: string) => {
+  const ownerSettings = await ensureOwnerPayoutSettings();
+  const ownerAccountLabel = ownerSettings.ownerName;
   const group = await prisma.group.findUnique({
     where: { id: groupId },
     include: {
@@ -733,7 +812,7 @@ export const runGroupPayout = async (groupId: string) => {
         metadata: {
           gross,
           fee,
-          ownerAccount: OWNER_ACCOUNT_NAME,
+          ownerAccount: ownerAccountLabel,
           payoutOrder: receiver.payoutOrder
         }
       }
@@ -746,7 +825,7 @@ export const runGroupPayout = async (groupId: string) => {
         amount: fee,
         metadata: {
           linkedTo: payoutTx.id,
-          ownerAccount: OWNER_ACCOUNT_NAME
+          ownerAccount: ownerAccountLabel
         }
       }
     });
@@ -758,7 +837,7 @@ export const runGroupPayout = async (groupId: string) => {
         sourceGroupId: group.id,
         sourceUserId: receiver.userId,
         transactionId: payoutTx.id,
-        ownerAccount: OWNER_ACCOUNT_NAME
+        ownerAccount: ownerAccountLabel
       }
     });
 
@@ -779,7 +858,7 @@ export const runGroupPayout = async (groupId: string) => {
       gross,
       net,
       fee,
-      ownerAccount: OWNER_ACCOUNT_NAME,
+      ownerAccount: ownerAccountLabel,
       transferReference: transfer.reference
     };
   });
@@ -845,6 +924,124 @@ export const processPayoutJobs = async () => {
   return outputs;
 };
 
+export const settleOwnerRevenue = async (payload?: { initiatedBy?: string; note?: string }) => {
+  const ownerSettings = await ensureOwnerPayoutSettings();
+  if (!ownerSettings.active) {
+    throw new Error("Owner payout profile is disabled.");
+  }
+  if (!ownerSettings.recipientCode || !ownerSettings.verifiedAt) {
+    throw new Error("Owner payout account is not linked/verified. Update owner payout settings first.");
+  }
+
+  const unsettledRevenues = await prisma.platformRevenue.findMany({
+    where: { settlementId: null },
+    orderBy: { createdAt: "asc" }
+  });
+
+  const grossAmount = toMoney(unsettledRevenues.reduce((sum, row) => sum + money(row.amount), 0));
+  if (grossAmount <= 0) {
+    return {
+      settled: false,
+      message: "No unsettled platform revenue available.",
+      grossAmount: 0,
+      settlement: null
+    };
+  }
+
+  try {
+    const transfer = await transferWithPaystack({
+      amount: grossAmount,
+      reason: "Platform revenue settlement",
+      recipientCode: ownerSettings.recipientCode,
+      recipient: {
+        name: ownerSettings.ownerName,
+        accountNumber: ownerSettings.accountNumber,
+        bankCode: ownerSettings.bankCode
+      }
+    });
+
+    return prisma.$transaction(async (tx) => {
+      const settlement = await tx.revenueSettlement.create({
+        data: {
+          status: SettlementStatus.COMPLETED,
+          grossAmount,
+          transferAmount: grossAmount,
+          ownerAccountName: ownerSettings.accountName,
+          ownerBankCode: ownerSettings.bankCode,
+          ownerAccountNumber: ownerSettings.accountNumber,
+          ownerRecipientCode: ownerSettings.recipientCode,
+          transferReference: transfer.reference,
+          initiatedBy: payload?.initiatedBy ?? null,
+          note: payload?.note ?? null
+        }
+      });
+
+      await tx.platformRevenue.updateMany({
+        where: {
+          id: {
+            in: unsettledRevenues.map((row) => row.id)
+          }
+        },
+        data: {
+          settlementId: settlement.id,
+          settledAt: new Date()
+        }
+      });
+
+      await tx.transaction.create({
+        data: {
+          type: TransactionType.OWNER_REVENUE_SETTLEMENT,
+          amount: grossAmount,
+          referenceId: transfer.reference,
+          metadata: {
+            settlementId: settlement.id,
+            revenueCount: unsettledRevenues.length,
+            ownerAccount: ownerSettings.accountName
+          }
+        }
+      });
+
+      return {
+        settled: true,
+        message: "Owner revenue settlement completed.",
+        grossAmount,
+        settlement
+      };
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "Settlement transfer failed.";
+    await prisma.revenueSettlement.create({
+      data: {
+        status: SettlementStatus.FAILED,
+        grossAmount,
+        transferAmount: 0,
+        ownerAccountName: ownerSettings.accountName,
+        ownerBankCode: ownerSettings.bankCode,
+        ownerAccountNumber: ownerSettings.accountNumber,
+        ownerRecipientCode: ownerSettings.recipientCode,
+        initiatedBy: payload?.initiatedBy ?? null,
+        note: `Failed: ${reason}`
+      }
+    });
+    throw new Error(`Settlement failed: ${reason}`);
+  }
+};
+
+export const runOwnerRevenueSettlementJobs = async () => {
+  try {
+    const result = await settleOwnerRevenue({
+      initiatedBy: "cron",
+      note: "Automated scheduled settlement"
+    });
+    return { ok: true, result };
+  } catch (error) {
+    return {
+      ok: false,
+      message: error instanceof Error ? error.message : "Revenue settlement cron failed."
+    };
+  }
+};
+
 export const getDashboard = async (userId: string) => {
   const user = await prisma.user.findUnique({
     where: { id: userId },
@@ -885,9 +1082,25 @@ export const getDashboard = async (userId: string) => {
 };
 
 export const getAdminRevenue = async () => {
+  const ownerSettings = await ensureOwnerPayoutSettings();
   const revenues = await prisma.platformRevenue.findMany({
     orderBy: { createdAt: "desc" },
     take: 100
+  });
+  const unsettledRows = await prisma.platformRevenue.findMany({
+    where: { settlementId: null }
+  });
+  const settlements = await prisma.revenueSettlement.findMany({
+    orderBy: { createdAt: "desc" },
+    take: 30,
+    include: {
+      revenues: {
+        select: {
+          id: true,
+          amount: true
+        }
+      }
+    }
   });
 
   const totalRevenue = revenues.reduce((sum, row) => sum + money(row.amount), 0);
@@ -897,14 +1110,33 @@ export const getAdminRevenue = async () => {
   const circleFees = revenues
     .filter((row) => row.type === RevenueType.CIRCLE_PAYOUT_FEE)
     .reduce((sum, row) => sum + money(row.amount), 0);
+  const unsettledRevenue = unsettledRows.reduce((sum, row) => sum + money(row.amount), 0);
 
   return {
-    ownerAccount: OWNER_ACCOUNT_NAME,
+    ownerAccount: ownerSettings.ownerName,
+    ownerSettings,
     totalRevenue: toMoney(totalRevenue),
     personalFees: toMoney(personalFees),
     circleFees: toMoney(circleFees),
+    unsettledRevenue: toMoney(unsettledRevenue),
+    settledRevenue: toMoney(totalRevenue - unsettledRevenue),
     capAmount: 10000,
     feeRate: 0.015,
-    records: revenues
+    records: revenues,
+    settlements: settlements.map((row) => ({
+      id: row.id,
+      status: row.status,
+      grossAmount: money(row.grossAmount),
+      transferAmount: money(row.transferAmount),
+      ownerAccountName: row.ownerAccountName,
+      ownerBankCode: row.ownerBankCode,
+      ownerAccountNumber: row.ownerAccountNumber,
+      transferReference: row.transferReference,
+      initiatedBy: row.initiatedBy,
+      note: row.note,
+      createdAt: row.createdAt,
+      revenueCount: row.revenues.length,
+      revenueAmount: toMoney(row.revenues.reduce((sum, revenue) => sum + money(revenue.amount), 0))
+    }))
   };
 };

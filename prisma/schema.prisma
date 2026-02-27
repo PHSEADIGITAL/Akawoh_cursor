@@ -36,6 +36,7 @@ enum TransactionType {
   WITHDRAWAL
   PERSONAL_WITHDRAWAL_FEE
   CIRCLE_PAYOUT_FEE
+  OWNER_REVENUE_SETTLEMENT
 }
 
 enum InviteStatus {
@@ -47,6 +48,11 @@ enum InviteStatus {
 enum RevenueType {
   PERSONAL_WITHDRAWAL_FEE
   CIRCLE_PAYOUT_FEE
+}
+
+enum SettlementStatus {
+  COMPLETED
+  FAILED
 }
 
 enum NotificationType {
@@ -189,7 +195,12 @@ model PlatformRevenue {
   sourceGroup    Group?      @relation("RevenueSourceGroup", fields: [sourceGroupId], references: [id], onDelete: SetNull)
   transactionId  String?
   ownerAccount   String
+  settlementId   String?
+  settlement     RevenueSettlement? @relation(fields: [settlementId], references: [id], onDelete: SetNull)
+  settledAt      DateTime?
   createdAt      DateTime    @default(now())
+
+  @@index([settlementId, createdAt])
 }
 
 model Notification {
@@ -200,4 +211,34 @@ model Notification {
   message   String
   read      Boolean          @default(false)
   createdAt DateTime         @default(now())
+}
+
+model OwnerPayoutSetting {
+  id              String    @id @default(cuid())
+  ownerName       String
+  bankCode        String
+  bankName        String?
+  accountNumber   String
+  accountName     String
+  recipientCode   String?
+  active          Boolean   @default(true)
+  verifiedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model RevenueSettlement {
+  id                 String           @id @default(uuid())
+  status             SettlementStatus @default(COMPLETED)
+  grossAmount        Decimal
+  transferAmount     Decimal
+  ownerAccountName   String
+  ownerBankCode      String
+  ownerAccountNumber String
+  ownerRecipientCode String?
+  transferReference  String?
+  note               String?
+  initiatedBy        String?
+  createdAt          DateTime         @default(now())
+  revenues           PlatformRevenue[]
 }

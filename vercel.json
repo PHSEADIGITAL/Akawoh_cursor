@@ -11,6 +11,10 @@
     {
       "path": "/api/cron/payout",
       "schedule": "0 7 * * *"
+    },
+    {
+      "path": "/api/cron/revenue-settlement",
+      "schedule": "30 7 * * *"
     }
   ]
 }
