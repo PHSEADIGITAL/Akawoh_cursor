@@ -1481,9 +1481,8 @@ export const processMonthlyJobs = async () => {
     try {
       const allocation = await runMonthlyAllocation(group.id);
       outputs.push({
-        groupId: group.id,
-        ok: true,
-        ...allocation
+        ...allocation,
+        ok: true
       });
     } catch (error) {
       outputs.push({
