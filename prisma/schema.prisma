@@ -1,0 +1,287 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum KYCStatus {
+  PENDING
+  VERIFIED
+}
+
+enum SavingsStatus {
+  ACTIVE
+  COMPLETED
+  WITHDRAWN
+}
+
+enum ContributionFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum TransactionType {
+  DEPOSIT
+  ALLOCATION
+  PAYOUT
+  WITHDRAWAL
+  PERSONAL_WITHDRAWAL_FEE
+  CIRCLE_PAYOUT_FEE
+  OWNER_REVENUE_SETTLEMENT
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+enum RevenueType {
+  PERSONAL_WITHDRAWAL_FEE
+  CIRCLE_PAYOUT_FEE
+}
+
+enum SettlementStatus {
+  COMPLETED
+  FAILED
+}
+
+enum NotificationType {
+  MISSED_CONTRIBUTION
+  UPCOMING_WITHDRAWAL
+  PAYOUT_COMPLETED
+  CARRY_OVER_ALERT
+  GROUP_INVITE
+}
+
+model User {
+  id                   String            @id @default(uuid())
+  name                 String
+  email                String            @unique
+  phone                String            @unique
+  walletBalance        Decimal           @default(0)
+  riskScore            Int               @default(100)
+  bvn                  String?
+  kycStatus            KYCStatus         @default(PENDING)
+  bankCode             String?
+  bankAccountNumber    String?
+  bankAccountName      String?
+  paystackCustomerCode String?
+  virtualAccountNumber String?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  lockedSavings        LockedSavings?
+  memberships          GroupMember[]
+  createdGroups        SavingsGroup[]    @relation("GroupCreator")
+  sentInvites          GroupInvite[]     @relation("InviteCreator")
+  receivedInvites      GroupInvite[]     @relation("InviteRecipient")
+  ledgerEntries        Ledger[]
+  transactions         Transaction[]
+  allocations          Allocation[]
+  notifications        Notification[]
+  revenues             PlatformRevenue[] @relation("RevenueSourceUser")
+}
+
+model LockedSavings {
+  id                    String                @id @default(uuid())
+  userId                String                @unique
+  user                  User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  contributionFrequency ContributionFrequency @default(DAILY)
+  dailyAmount           Decimal
+  totalTarget           Decimal
+  lockDate              DateTime
+  totalPaid             Decimal               @default(0)
+  status                SavingsStatus         @default(ACTIVE)
+  createdAt             DateTime              @default(now())
+  updatedAt             DateTime              @updatedAt
+  allocations           Allocation[]
+}
+
+model SavingsGroup {
+  id                String            @id @default(uuid())
+  name              String
+  creatorId         String
+  creator           User              @relation("GroupCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  monthlyAmount     Decimal
+  bufferAmount      Decimal
+  totalMonths       Int
+  currentMonth      Int               @default(1)
+  locked            Boolean           @default(false)
+  isActive          Boolean           @default(true)
+  escrowBalance     Decimal           @default(0)
+  payoutProcessing  Boolean           @default(false)
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+  members           GroupMember[]
+  invites           GroupInvite[]
+  ledgerEntries     Ledger[]
+  allocations       Allocation[]
+  transactions      Transaction[]
+  cronLocks         CronExecutionLock[]
+  revenues           PlatformRevenue[] @relation("RevenueSourceGroup")
+
+  @@index([isActive, currentMonth])
+}
+
+model GroupMember {
+  id               String       @id @default(uuid())
+  userId           String
+  groupId          String
+  payoutOrder      Int
+  isActive         Boolean      @default(true)
+  hasDefaulted     Boolean      @default(false)
+  graceUsed        Boolean      @default(false)
+  totalContributed Decimal      @default(0)
+  bufferLocked     Decimal      @default(0)
+  joinedAt         DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group            SavingsGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@unique([groupId, payoutOrder])
+  @@index([groupId, isActive, payoutOrder])
+}
+
+model GroupInvite {
+  id                  String       @id @default(uuid())
+  groupId             String
+  group               SavingsGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  creatorId           String
+  creator             User         @relation("InviteCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  inviteeId           String
+  invitee             User         @relation("InviteRecipient", fields: [inviteeId], references: [id], onDelete: Cascade)
+  phoneLookup         String
+  proposedPayoutOrder Int?
+  status              InviteStatus @default(PENDING)
+  createdAt           DateTime     @default(now())
+  acknowledgedAt      DateTime?
+  respondedAt         DateTime?
+
+  @@index([groupId, status])
+}
+
+model Ledger {
+  id        String       @id @default(uuid())
+  userId    String
+  groupId   String?
+  type      String
+  amount    Decimal
+  meta      String?
+  createdAt DateTime     @default(now())
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  group     SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([groupId, createdAt])
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  action    String
+  groupId   String?
+  userId    String?
+  data      String?
+  createdAt DateTime @default(now())
+
+  @@index([groupId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model CronExecutionLock {
+  id        String       @id
+  groupId   String?
+  group     SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  type      String
+  month     Int?
+  createdAt DateTime     @default(now())
+
+  @@index([groupId, type, month])
+}
+
+model Transaction {
+  id          String          @id @default(uuid())
+  userId      String?
+  user        User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  groupId     String?
+  group       SavingsGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  type        TransactionType
+  amount      Decimal
+  referenceId String?         @unique
+  metadata    Json?
+  timestamp   DateTime        @default(now())
+}
+
+model Allocation {
+  id              String        @id @default(uuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lockedSavingsId String?
+  lockedSavings   LockedSavings? @relation(fields: [lockedSavingsId], references: [id], onDelete: SetNull)
+  groupId         String?
+  group           SavingsGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  amount          Decimal
+  timestamp       DateTime      @default(now())
+}
+
+model PlatformRevenue {
+  id             String      @id @default(uuid())
+  type           RevenueType
+  amount         Decimal
+  sourceUserId   String?
+  sourceUser     User?       @relation("RevenueSourceUser", fields: [sourceUserId], references: [id], onDelete: SetNull)
+  sourceGroupId  String?
+  sourceGroup    SavingsGroup? @relation("RevenueSourceGroup", fields: [sourceGroupId], references: [id], onDelete: SetNull)
+  transactionId  String?
+  ownerAccount   String
+  settlementId   String?
+  settlement     RevenueSettlement? @relation(fields: [settlementId], references: [id], onDelete: SetNull)
+  settledAt      DateTime?
+  createdAt      DateTime    @default(now())
+
+  @@index([settlementId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  message   String
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+}
+
+model OwnerPayoutSetting {
+  id              String    @id @default(cuid())
+  ownerName       String
+  bankCode        String
+  bankName        String?
+  accountNumber   String
+  accountName     String
+  recipientCode   String?
+  active          Boolean   @default(true)
+  verifiedAt      DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+}
+
+model RevenueSettlement {
+  id                 String           @id @default(uuid())
+  status             SettlementStatus @default(COMPLETED)
+  grossAmount        Decimal
+  transferAmount     Decimal
+  ownerAccountName   String
+  ownerBankCode      String
+  ownerAccountNumber String
+  ownerRecipientCode String?
+  transferReference  String?
+  note               String?
+  initiatedBy        String?
+  createdAt          DateTime         @default(now())
+  revenues           PlatformRevenue[]
+}
